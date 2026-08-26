@@ -1,0 +1,74 @@
+name: Sync mirror list
+
+# Pulls the signed mirror list from a distribution mirror and commits it here, so the launcher has
+# a second place to find it when every mirror is blocked.
+#
+# Pull, not push, on purpose: nothing on our side needs a GitHub credential, and the built-in
+# GITHUB_TOKEN never leaves the runner. Integrity does not depend on this repository — the launcher
+# verifies the Ed25519 signature inside the file and rejects anything that fails.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-mirrors
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and validate
+        id: fetch
+        run: |
+          set -euo pipefail
+          SRC="https://v3222721.hosted-by-vdsina.ru/config/mirrors.json"
+
+          # The mirror caps concurrent connections per IP and answers 429 with an HTML body while
+          # players are downloading. Retry, and never let that page reach the repository.
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS --max-time 20 -o candidate.json "$SRC"; then break; fi
+            sleep $((attempt * 10))
+          done
+          test -s candidate.json
+
+          python3 - <<'PY'
+          import base64, json, sys, pathlib
+          new = json.loads(pathlib.Path("candidate.json").read_text())
+          for field in ("payload_b64", "sig", "key_id"):
+              if field not in new:
+                  sys.exit(f"not a signed envelope: {field} missing")
+          serial = json.loads(base64.b64decode(new["payload_b64"]))["serial"]
+
+          current = pathlib.Path("bohpts/mirrors.json")
+          if current.exists():
+              old = json.loads(current.read_text())
+              old_serial = json.loads(base64.b64decode(old["payload_b64"]))["serial"]
+              # A bootstrap channel that can move backwards is a rollback vector: the launcher
+              # would see an older-but-validly-signed list. Refuse rather than commit.
+              if serial < old_serial:
+                  sys.exit(f"refusing to go backwards: {serial} < {old_serial}")
+          print(f"serial={serial}")
+          PY
+
+          mv candidate.json bohpts/mirrors.json
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- bohpts/mirrors.json; then
+            echo "unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bohpts/mirrors.json
+          git commit -m "chore: sync signed mirror list"
+          git push
