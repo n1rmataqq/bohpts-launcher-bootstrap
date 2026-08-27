@@ -29,12 +29,26 @@ jobs:
         id: fetch
         run: |
           set -euo pipefail
-          SRC="https://v3222721.hosted-by-vdsina.ru/config/mirrors.json"
+
+          # Sources come from the list already committed here, not from a hardcoded host: when the
+          # fleet moved to its own domain the pinned provider name kept resolving but stopped
+          # matching the certificate, and this channel sat frozen while both other channels moved.
+          # Reading the document we already carry means a fleet change cannot outrun this workflow.
+          mapfile -t SRCS < <(python3 -c '
+          import base64, json, pathlib
+          doc = json.loads(pathlib.Path("bohpts/mirrors.json").read_text())
+          for m in json.loads(base64.b64decode(doc["payload_b64"]))["mirrors"]:
+              if m.get("enabled"):
+                  print(m["base_url"].rstrip("/") + "/config/mirrors.json")
+          ')
+          test "${#SRCS[@]}" -gt 0
 
           # The mirror caps concurrent connections per IP and answers 429 with an HTML body while
           # players are downloading. Retry, and never let that page reach the repository.
           for attempt in 1 2 3 4 5; do
-            if curl -fsS --max-time 20 -o candidate.json "$SRC"; then break; fi
+            for src in "${SRCS[@]}"; do
+              if curl -fsS --max-time 20 -o candidate.json "$src"; then break 2; fi
+            done
             sleep $((attempt * 10))
           done
           test -s candidate.json
